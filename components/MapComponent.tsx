@@ -3,7 +3,7 @@ import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { getUser } from "@/lib/utils/getUser";
 
@@ -14,28 +14,42 @@ L.Icon.Default.mergeOptions({
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
 
+interface Snap {
+  id: string;
+  user_id: string;
+  image_url: string;
+  description: string;
+  lat: number;
+  lng: number;
+  created_at: string;
+}
+
+interface LocationEvent {
+  latlng: L.LatLng;
+  [key: string]: any;
+}
+
+interface LocationErrorEvent {
+  message: string;
+  code: number;
+  [key: string]: any;
+}
+
 function LocateUser() {
   const map = useMap();
+  
   useEffect(() => {
-    interface LocationEvent {
-      latlng: L.LatLng;
-      [key: string]: any;
-    }
-
     function onLocationFound(e: LocationEvent): void {
-      console.log("locationfound", e);
-      L.marker(e.latlng).addTo(map)
-        .bindPopup("You are here!").openPopup();
-    }
-    interface LocationErrorEvent {
-      message: string;
-      code: number;
-      [key: string]: any;
+      console.log("Location found:", e.latlng);
     }
 
     function onLocationError(e: LocationErrorEvent): void {
-      console.log("locationerror", e);
-      alert("Location access denied.");
+      console.warn("Location error:", e);
+      if (e.code === 1) {
+        alert("Location access denied. Please enable location services to see your position on the map.");
+      } else {
+        alert("Unable to retrieve your location. Please check your location settings.");
+      }
     }
 
     map.on("locationfound", onLocationFound);
@@ -47,10 +61,11 @@ function LocateUser() {
       map.off("locationerror", onLocationError);
     };
   }, [map]);
+  
   return null;
 }
 
-function dataURLtoBlob(dataurl: string) {
+function dataURLtoBlob(dataurl: string): Blob {
   const arr = dataurl.split(',');
   const mime = arr[0].match(/:(.*?);/)?.[1] || 'image/png';
   const bstr = atob(arr[1]);
@@ -62,74 +77,136 @@ function dataURLtoBlob(dataurl: string) {
   return new Blob([u8arr], { type: mime });
 }
 
-const putImageInStorage = async (image: string ) => {
+const putImageInStorage = async (image: string): Promise<string> => {
   const supabase = await createClient();
   const user = await getUser();
+  
   if (!user || !user.id) {
     throw new Error("User not found. Cannot upload image.");
   }
+  
   const imageBlob = dataURLtoBlob(image);
-  const { data, error } = await supabase.storage.from("images")
-    .upload(`user-${user.id}/${Date.now()}.png`, imageBlob, {
+  const fileName = `user-${user.id}/${Date.now()}.png`;
+  
+  const { data, error } = await supabase.storage
+    .from("images")
+    .upload(fileName, imageBlob, {
       contentType: "image/png",
       upsert: true,
     });
 
   if (error) {
-    throw new Error("Failed to upload image");
-  } 
+    console.error("Storage upload error:", error);
+    throw new Error(`Failed to upload image: ${error.message}`);
+  }
 
   return data.path;
-}
+};
 
-const onHandleSubmit = async (photo: string, description: string, lat: number | null, lng: number | null) => {
+const onHandleSubmit = async (
+  photo: string, 
+  description: string, 
+  lat: number | null, 
+  lng: number | null
+): Promise<void> => {
+  if (!lat || !lng) {
+    throw new Error("Location is required to post a snap.");
+  }
+
   const supabase = await createClient();
   const user = await getUser();
+  
   if (!user || !user.id) {
     throw new Error("User not found. Cannot submit post.");
   }
 
-  const imagePath = await putImageInStorage(photo);
+  try {
+    const imagePath = await putImageInStorage(photo);
 
-  const { data, error } = await supabase.from("snaps").insert({
-    user_id: user.id,
-    image_url: imagePath,
-    description,
-    lat,
-    lng,
-    created_at: new Date().toISOString(),
-  });
+    const { data, error } = await supabase.from("snaps").insert({
+      user_id: user.id,
+      image_url: imagePath,
+      description: description.trim(),
+      lat,
+      lng,
+      created_at: new Date().toISOString(),
+    });
 
-  console.log(data, error);
-}
+    if (error) {
+      console.error("Database insert error:", error);
+      throw new Error(`Failed to save snap: ${error.message}`);
+    }
+    
+  } catch (error) {
+    console.error("Submit error:", error);
+    throw error;
+  }
+};
 
 const MapComponent = () => {
   const [showCamera, setShowCamera] = useState(false);
   const [useFrontCamera, setUseFrontCamera] = useState(false);
-  const videoRef = useRef(null);
-  const canvasRef = useRef(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const [photo, setPhoto] = useState<string | null>(null);
   const [description, setDescription] = useState("");
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
-  const [snaps, setSnaps] = useState<any[]>([]);
+  const [snaps, setSnaps] = useState<Snap[]>([]);
+  const [error, setError] = useState<string | null>(null);
   
-  useEffect(() => {
-    const fetchSnaps = async () => {
+  const markerRefs = useRef<(L.Marker | null)[]>([]);
+  const cleanupStream = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, []);
+
+  const fetchSnaps = useCallback(async () => {
+    try {
       const supabase = await createClient();
-      const { data, error } = await supabase.from("snaps").select("*");
+      const { data, error } = await supabase
+        .from("snaps")
+        .select("*")
+        .order("created_at", { ascending: false });
       if (error) {
-        console.error("[SNAPS] Eroare la fetch:", error);
+        console.error("Error fetching snaps:", error);
+        setError("Failed to load snaps");
+        return;
       }
       if (data) {
-        console.log("[SNAPS] Fetched:", data);
         setSnaps(data);
-      } else {
-        console.warn("[SNAPS] Nu s-au gasit snaps in DB!");
+      }
+    } catch (err) {
+      console.error("Fetch snaps error:", err);
+      setError("Failed to load snaps");
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSnaps();
+    let supabaseRealtime: any = null;
+    (async () => {
+      const supabase = await createClient();
+      supabaseRealtime = supabase.channel('snaps-realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'snaps' }, (payload: any) => {
+          fetchSnaps();
+        })
+        .subscribe();
+    })();
+    return () => {
+      if (supabaseRealtime) {
+        supabaseRealtime.unsubscribe();
       }
     };
-    fetchSnaps();
-  }, []);
+  }, [fetchSnaps]);
+
 
   useEffect(() => {
     if (navigator.geolocation) {
@@ -139,35 +216,74 @@ const MapComponent = () => {
           setLng(pos.coords.longitude);
         },
         (err) => {
-          console.warn("Could not get location", err);
+          console.warn("Could not get location:", err);
+          setError("Location access denied. Please enable location services.");
         },
-        { enableHighAccuracy: true }
+        { 
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 300000
+        }
       );
+    } else {
+      setError("Geolocation is not supported by this browser.");
     }
   }, []);
 
   useEffect(() => {
-    if (showCamera && videoRef.current) {
-      navigator.mediaDevices.getUserMedia({
-        video: { facingMode: useFrontCamera ? "user" : "environment" }
-      })
-        .then((stream) => {
-          (videoRef.current as any).srcObject = stream;
-        });
-    }
-    if (!showCamera && videoRef.current && (videoRef.current as any).srcObject) {
-      const tracks = (videoRef.current as any).srcObject.getTracks();
-      tracks.forEach((track: any) => track.stop());
-    }
-  }, [showCamera, useFrontCamera]);
+    const setupCamera = async () => {
+      if (showCamera && videoRef.current) {
+        try {
+          cleanupStream();
+          
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { 
+              facingMode: useFrontCamera ? "user" : "environment",
+              width: { ideal: 1920 },
+              height: { ideal: 1080 }
+            }
+          });
+          
+          streamRef.current = stream;
+          videoRef.current.srcObject = stream;
+        } catch (err) {
+          console.error("Camera error:", err);
+          setError("Failed to access camera. Please check camera permissions.");
+          setShowCamera(false);
+        }
+      } else if (!showCamera) {
+        cleanupStream();
+      }
+    };
+
+    setupCamera();
+  }, [showCamera, useFrontCamera, cleanupStream]);
+
+  useEffect(() => {
+    return () => {
+      cleanupStream();
+    };
+  }, [cleanupStream]);
 
   const handleCapture = () => {
-    const video = videoRef.current as any;
-    const canvas = canvasRef.current as any;
-    if (video && canvas) {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (!video || !canvas) {
+      setError("Camera not ready. Please try again.");
+      return;
+    }
+
+    try {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext("2d");
+      
+      if (!ctx) {
+        setError("Failed to get canvas context.");
+        return;
+      }
+
       if (useFrontCamera) {
         ctx.save();
         ctx.translate(canvas.width, 0);
@@ -177,26 +293,65 @@ const MapComponent = () => {
       } else {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       }
-      const dataUrl = canvas.toDataURL("image/png");
-      // TEST: log the dataUrl length and a preview
-      console.log("[TEST] Captured photo dataUrl length:", dataUrl.length);
-      console.log("[TEST] Captured photo dataUrl (first 100 chars):", dataUrl.slice(0, 100));
+      
+      const dataUrl = canvas.toDataURL("image/png", 0.8);
       setPhoto(dataUrl);
-
-      if (video.srcObject) {
-        const tracks = video.srcObject.getTracks();
-        tracks.forEach((track: any) => track.stop());
-        video.srcObject = null;
-      }
       setShowCamera(false);
+      cleanupStream();
+    } catch (err) {
+      console.error("Capture error:", err);
+      setError("Failed to capture photo. Please try again.");
     }
   };
 
+  const handleSubmit = async () => {
+    if (!photo || !description.trim() || !lat || !lng) {
+      setError("Please provide a photo, description, and location.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError(null);
+
+    try {
+      await onHandleSubmit(photo, description, lat, lng);
+      setPhoto(null);
+      setDescription("");
+      setError(null);
+
+      await fetchSnaps();
+    } catch (err) {
+      console.error("Submit error:", err);
+      setError(err instanceof Error ? err.message : "Failed to submit snap");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const mapCenter: [number, number] = [37.7749, -122.4194];
+  const mapZoom = 12;
+
   return (
     <div>
+      {error && (
+        <div className="fixed top-4 left-4 right-4 z-50 bg-red-600 text-white p-3 rounded-lg shadow-lg">
+          <div className="flex justify-between items-center">
+            <span>{error}</span>
+            <button 
+              onClick={() => setError(null)}
+              className="ml-2 text-white hover:text-gray-200"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="fixed inset-0 w-full h-full z-0">
         <div style={{ height: "100vh", width: "100vw" }}>
           <MapContainer
+            center={mapCenter}
+            zoom={mapZoom}
             scrollWheelZoom={true}
             style={{ height: "100vh", width: "100vw" }}
           >
@@ -205,65 +360,89 @@ const MapComponent = () => {
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
             <LocateUser />
-            {snaps.map(snap => {
-              const lat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
-              const lng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
-              if (!lat || !lng) return null;
+            {snaps.map((snap, idx) => {
+              const snapLat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
+              const snapLng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
+              if (!snapLat || !snapLng || isNaN(snapLat) || isNaN(snapLng)) {
+                console.warn(`Invalid coordinates for snap ${snap.id}:`, { lat: snap.lat, lng: snap.lng });
+                return null;
+              }
               return (
-                <>
-                  <Marker key={snap.id} position={[lat, lng]} />
-                  <div
-                    key={snap.id + '-overlay'}
-                    style={{
-                      position: 'absolute',
-                      left: `calc(50% + ${(lng - snaps[0].lng) * 100}px)`, // crude projection for demo
-                      top: `calc(50% - ${(lat - snaps[0].lat) * 100}px)`
-                    }}
-                    className="z-[1000] pointer-events-auto"
-                  >
-                    <div className="flex flex-col items-center bg-black/80 rounded-xl p-3 border border-zinc-700 shadow-xl">
+                <Marker
+                  key={`marker-${snap.id}`}
+                  position={[snapLat, snapLng]}
+                  ref={(el) => {
+                    markerRefs.current[idx] = el;
+                  }}
+                >
+                  <Popup maxWidth={800} maxHeight={900} closeOnEscapeKey={true}>
+                    <div
+                      className="flex flex-col items-center p-2 bg-white rounded-lg shadow-lg"
+                      style={{ overflow: 'hidden', width: '100%', maxWidth: 700, boxSizing: 'border-box' }}
+                    >
                       <img
                         src={`${SUPABASE_URL}/storage/v1/object/public/images/${snap.image_url}`}
-                        alt="Snap image"
-                        className="max-h-[30vh] max-w-xs object-contain rounded mb-2"
-                        style={{background: '#222'}}
+                        alt="Snap"
+                        className="rounded-lg border border-zinc-300 mb-3"
+                        style={{
+                          display: 'block',
+                          maxWidth: '100%',
+                          maxHeight: '65vh',
+                          width: 'auto',
+                          height: 'auto',
+                          background: '#f0f0f0',
+                          objectFit: 'contain',
+                        }}
+                        loading="lazy"
                       />
-                      <div className="text-white text-sm text-center break-words max-w-xs">{snap.description}</div>
+                      <div className="text-gray-800 text-base text-center break-words w-full px-2 leading-tight mb-1">
+                        {snap.description.length > 60 ? `${snap.description.substring(0, 60)}...` : snap.description}
+                      </div>
+                      <div className="text-gray-500 text-xs mt-1 font-mono">
+                        {new Date(snap.created_at).toLocaleDateString('ro-RO', {
+                          day: '2-digit',
+                          month: '2-digit',
+                          year: '2-digit'
+                        })}
+                      </div>
                     </div>
-                  </div>
-                </>
+                  </Popup>
+                </Marker>
               );
             })}
           </MapContainer>
         </div>
       </div>
 
-      {/* Remove always-visible gallery, only show on map pins */}
-
       {showCamera && (
-        <div className="fixed inset-0 bg-black/80 flex flex-col items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
           <video
             ref={videoRef}
             autoPlay
-            className={`rounded-lg shadow-lg w-full max-w-xs mb-4 ${useFrontCamera ? 'scale-x-[-1]' : ''}`}
+            playsInline
+            muted
+            className="rounded-lg shadow-lg w-full max-w-sm mb-4"
             style={useFrontCamera ? { transform: 'scaleX(-1)' } : {}}
           />
-          <div className="flex gap-2 mb-4">
+          <div className="flex gap-3 mb-4 flex-wrap justify-center">
             <button
-              className="min-w-[100px] px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
+              className="min-w-[80px] px-4 py-2 bg-green-600 text-white rounded-full font-semibold shadow hover:bg-green-700 transition-colors"
               onClick={handleCapture}
             >
               Capture
             </button>
             <button
-              className="min-w-[100px] px-6 py-2 bg-blue-600 text-white rounded-full font-bold shadow hover:bg-blue-700"
+              className="min-w-[80px] px-4 py-2 bg-blue-600 text-white rounded-full font-semibold shadow hover:bg-blue-700 transition-colors"
               onClick={() => setUseFrontCamera((v) => !v)}
             >
-              Invert
+              Flip
             </button>
             <button
-              className="min-w-[100px] px-6 py-2 bg-gray-700 text-white rounded-full font-bold shadow hover:bg-gray-800"
-              onClick={() => setShowCamera(false)}
+              className="min-w-[80px] px-4 py-2 bg-gray-600 text-white rounded-full font-semibold shadow hover:bg-gray-700 transition-colors"
+              onClick={() => {
+                setShowCamera(false);
+                cleanupStream();
+              }}
             >
               Cancel
             </button>
@@ -273,36 +452,40 @@ const MapComponent = () => {
       )}
 
       {photo && (
-        <div className="fixed inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
-          <div className="bg-zinc-900 rounded-xl shadow-2xl p-6 flex flex-col items-center max-w-xs w-full border border-zinc-700">
-            <img src={photo} alt="Captured" className="max-w-full max-h-[70vh] object-contain rounded mb-4 border-4 border-zinc-800" />
+        <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4">
+          <div className="bg-zinc-900 rounded-xl shadow-2xl p-6 flex flex-col items-center max-w-sm w-full border border-zinc-700">
+            <img 
+              src={photo} 
+              alt="Captured" 
+              className="max-w-full max-h-[50vh] object-contain rounded mb-4 border-2 border-zinc-700" 
+            />
             <textarea
-              className="w-full mb-4 p-2 rounded bg-zinc-800 text-white border border-zinc-700 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full mb-4 p-3 rounded-lg bg-zinc-800 text-white border border-zinc-600 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               rows={3}
               placeholder="Add a description..."
               value={description}
               onChange={e => setDescription(e.target.value)}
+              maxLength={500}
             />
-            <div className="flex gap-4">
+            <div className="text-xs text-zinc-400 mb-4 self-end">
+              {description.length}/500
+            </div>
+            <div className="flex gap-3 w-full">
               <button
-                className="min-w-[100px] px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
-                onClick={async () => {
-                  if (photo && description && lat && lng) {
-                    await onHandleSubmit(photo, description, lat, lng);
-                    setPhoto(null);
-                    setDescription("");
-                  }
-                }}
-                disabled={!photo || !description || !lat || !lng}
+                className="flex-1 px-4 py-3 bg-green-600 text-white rounded-lg font-semibold shadow hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                onClick={handleSubmit}
+                disabled={!photo || !description.trim() || !lat || !lng || isSubmitting}
               >
-                Confirm
+                {isSubmitting ? "Posting..." : "Post"}
               </button>
               <button
-                className="min-w-[100px] px-6 py-2 bg-red-600 text-white rounded-full font-bold shadow hover:bg-red-700"
+                className="flex-1 px-4 py-3 bg-red-600 text-white rounded-lg font-semibold shadow hover:bg-red-700 transition-colors"
                 onClick={() => {
                   setPhoto(null);
+                  setDescription("");
                   setTimeout(() => setShowCamera(true), 100);
                 }}
+                disabled={isSubmitting}
               >
                 Retake
               </button>
@@ -312,13 +495,17 @@ const MapComponent = () => {
       )}
 
       <button
-        className="fixed bottom-8 right-8 z-50 flex items-center gap-2 bg-black/90 text-white px-7 py-4 rounded-full shadow-2xl transition-all duration-200 pointer-events-auto border-2 border-white/60"
-        style={{ fontWeight: 800, fontSize: '1.2rem', letterSpacing: '0.04em', boxShadow: '0 8px 32px 0 rgba(0,0,0,0.18)' }}
-        onClick={() => setShowCamera(true)}
+        className="fixed bottom-6 right-6 z-40 px-6 py-3 bg-zinc-900 text-white rounded-lg font-semibold shadow-lg hover:bg-zinc-800 transition-colors border border-zinc-700"
+        onClick={() => {
+          if (!lat || !lng) {
+            setError("Location is not available. Please enable location services.");
+            return;
+          }
+          setShowCamera(true);
+        }}
+        disabled={!lat || !lng}
+        title="Post a photo"
       >
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-7 h-7 drop-shadow">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-        </svg>
         Post
       </button>
     </div>
