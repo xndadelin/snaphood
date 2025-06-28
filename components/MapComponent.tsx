@@ -1,8 +1,11 @@
 "use client";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import React, { useEffect } from "react";
+import { useEffect, useState, useRef } from "react";
+import { createClient } from "@/lib/supabase/client";
+import { getUser } from "@/lib/utils/getUser";
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -47,14 +50,103 @@ function LocateUser() {
   return null;
 }
 
-export default function MapComponent() {
-  const [showCamera, setShowCamera] = React.useState(false);
-  const [useFrontCamera, setUseFrontCamera] = React.useState(false);
-  const videoRef = React.useRef(null);
-  const canvasRef = React.useRef(null);
-  const [photo, setPhoto] = React.useState<string | null>(null);
+function dataURLtoBlob(dataurl: string) {
+  const arr = dataurl.split(',');
+  const mime = arr[0].match(/:(.*?);/)?.[1] || 'image/png';
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) {
+    u8arr[n] = bstr.charCodeAt(n);
+  }
+  return new Blob([u8arr], { type: mime });
+}
 
-  React.useEffect(() => {
+const putImageInStorage = async (image: string ) => {
+  const supabase = await createClient();
+  const user = await getUser();
+  if (!user || !user.id) {
+    throw new Error("User not found. Cannot upload image.");
+  }
+  const imageBlob = dataURLtoBlob(image);
+  const { data, error } = await supabase.storage.from("images")
+    .upload(`user-${user.id}/${Date.now()}.png`, imageBlob, {
+      contentType: "image/png",
+      upsert: true,
+    });
+
+  if (error) {
+    throw new Error("Failed to upload image");
+  } 
+
+  return data.path;
+}
+
+const onHandleSubmit = async (photo: string, description: string, lat: number | null, lng: number | null) => {
+  const supabase = await createClient();
+  const user = await getUser();
+  if (!user || !user.id) {
+    throw new Error("User not found. Cannot submit post.");
+  }
+
+  const imagePath = await putImageInStorage(photo);
+
+  const { data, error } = await supabase.from("snaps").insert({
+    user_id: user.id,
+    image_url: imagePath,
+    description,
+    lat,
+    lng,
+    created_at: new Date().toISOString(),
+  });
+
+  console.log(data, error);
+}
+
+const MapComponent = () => {
+  const [showCamera, setShowCamera] = useState(false);
+  const [useFrontCamera, setUseFrontCamera] = useState(false);
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [photo, setPhoto] = useState<string | null>(null);
+  const [description, setDescription] = useState("");
+  const [lat, setLat] = useState<number | null>(null);
+  const [lng, setLng] = useState<number | null>(null);
+  const [snaps, setSnaps] = useState<any[]>([]);
+  
+  useEffect(() => {
+    const fetchSnaps = async () => {
+      const supabase = await createClient();
+      const { data, error } = await supabase.from("snaps").select("*");
+      if (error) {
+        console.error("[SNAPS] Eroare la fetch:", error);
+      }
+      if (data) {
+        console.log("[SNAPS] Fetched:", data);
+        setSnaps(data);
+      } else {
+        console.warn("[SNAPS] Nu s-au gasit snaps in DB!");
+      }
+    };
+    fetchSnaps();
+  }, []);
+
+  useEffect(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setLat(pos.coords.latitude);
+          setLng(pos.coords.longitude);
+        },
+        (err) => {
+          console.warn("Could not get location", err);
+        },
+        { enableHighAccuracy: true }
+      );
+    }
+  }, []);
+
+  useEffect(() => {
     if (showCamera && videoRef.current) {
       navigator.mediaDevices.getUserMedia({
         video: { facingMode: useFrontCamera ? "user" : "environment" }
@@ -76,8 +168,20 @@ export default function MapComponent() {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      setPhoto(canvas.toDataURL("image/png"));
+      if (useFrontCamera) {
+        ctx.save();
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      const dataUrl = canvas.toDataURL("image/png");
+      // TEST: log the dataUrl length and a preview
+      console.log("[TEST] Captured photo dataUrl length:", dataUrl.length);
+      console.log("[TEST] Captured photo dataUrl (first 100 chars):", dataUrl.slice(0, 100));
+      setPhoto(dataUrl);
 
       if (video.srcObject) {
         const tracks = video.srcObject.getTracks();
@@ -91,10 +195,8 @@ export default function MapComponent() {
   return (
     <div>
       <div className="fixed inset-0 w-full h-full z-0">
-        <div style={{ height: "100vh", width: "100vw", pointerEvents: "none" }}>
+        <div style={{ height: "100vh", width: "100vw" }}>
           <MapContainer
-            center={[37.7749, -122.4194]}
-            zoom={13}
             scrollWheelZoom={true}
             style={{ height: "100vh", width: "100vw" }}
           >
@@ -103,11 +205,41 @@ export default function MapComponent() {
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
             <LocateUser />
+            {snaps.map(snap => {
+              const lat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
+              const lng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
+              if (!lat || !lng) return null;
+              return (
+                <>
+                  <Marker key={snap.id} position={[lat, lng]} />
+                  <div
+                    key={snap.id + '-overlay'}
+                    style={{
+                      position: 'absolute',
+                      left: `calc(50% + ${(lng - snaps[0].lng) * 100}px)`, // crude projection for demo
+                      top: `calc(50% - ${(lat - snaps[0].lat) * 100}px)`
+                    }}
+                    className="z-[1000] pointer-events-auto"
+                  >
+                    <div className="flex flex-col items-center bg-black/80 rounded-xl p-3 border border-zinc-700 shadow-xl">
+                      <img
+                        src={`${SUPABASE_URL}/storage/v1/object/public/images/${snap.image_url}`}
+                        alt="Snap image"
+                        className="max-h-[30vh] max-w-xs object-contain rounded mb-2"
+                        style={{background: '#222'}}
+                      />
+                      <div className="text-white text-sm text-center break-words max-w-xs">{snap.description}</div>
+                    </div>
+                  </div>
+                </>
+              );
+            })}
           </MapContainer>
         </div>
       </div>
 
-      {/* Camera Modal */}
+      {/* Remove always-visible gallery, only show on map pins */}
+
       {showCamera && (
         <div className="fixed inset-0 bg-black/80 flex flex-col items-center justify-center z-50">
           <video
@@ -118,19 +250,19 @@ export default function MapComponent() {
           />
           <div className="flex gap-2 mb-4">
             <button
-              className="px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
+              className="min-w-[100px] px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
               onClick={handleCapture}
             >
               Capture
             </button>
             <button
-              className="px-6 py-2 bg-blue-600 text-white rounded-full font-bold shadow hover:bg-blue-700"
+              className="min-w-[100px] px-6 py-2 bg-blue-600 text-white rounded-full font-bold shadow hover:bg-blue-700"
               onClick={() => setUseFrontCamera((v) => !v)}
             >
               Invert
             </button>
             <button
-              className="px-4 py-2 bg-gray-700 text-white rounded-full text-sm"
+              className="min-w-[100px] px-6 py-2 bg-gray-700 text-white rounded-full font-bold shadow hover:bg-gray-800"
               onClick={() => setShowCamera(false)}
             >
               Cancel
@@ -143,17 +275,34 @@ export default function MapComponent() {
       {photo && (
         <div className="fixed inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
           <div className="bg-zinc-900 rounded-xl shadow-2xl p-6 flex flex-col items-center max-w-xs w-full border border-zinc-700">
-            <img src={photo} alt="Captured" className="w-64 h-64 object-cover rounded mb-4 border-4 border-zinc-800" />
+            <img src={photo} alt="Captured" className="max-w-full max-h-[70vh] object-contain rounded mb-4 border-4 border-zinc-800" />
+            <textarea
+              className="w-full mb-4 p-2 rounded bg-zinc-800 text-white border border-zinc-700 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+              rows={3}
+              placeholder="Add a description..."
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+            />
             <div className="flex gap-4">
               <button
-                className="px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
-                onClick={() => setPhoto(null)}
+                className="min-w-[100px] px-6 py-2 bg-green-600 text-white rounded-full font-bold shadow hover:bg-green-700"
+                onClick={async () => {
+                  if (photo && description && lat && lng) {
+                    await onHandleSubmit(photo, description, lat, lng);
+                    setPhoto(null);
+                    setDescription("");
+                  }
+                }}
+                disabled={!photo || !description || !lat || !lng}
               >
                 Confirm
               </button>
               <button
-                className="px-6 py-2 bg-red-600 text-white rounded-full font-bold shadow hover:bg-red-700"
-                onClick={() => setPhoto(null)}
+                className="min-w-[100px] px-6 py-2 bg-red-600 text-white rounded-full font-bold shadow hover:bg-red-700"
+                onClick={() => {
+                  setPhoto(null);
+                  setTimeout(() => setShowCamera(true), 100);
+                }}
               >
                 Retake
               </button>
@@ -174,4 +323,6 @@ export default function MapComponent() {
       </button>
     </div>
   );
-}
+};
+
+export default MapComponent;
