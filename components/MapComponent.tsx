@@ -22,6 +22,7 @@ interface Snap {
   lat: number;
   lng: number;
   created_at: string;
+  reactions?: { [emoji: string]: string[] };
 }
 
 interface LocationEvent {
@@ -35,12 +36,28 @@ interface LocationErrorEvent {
   [key: string]: any;
 }
 
-function LocateUser() {
+const DotIcon = new L.DivIcon({
+  className: '',
+  html: '<div style="width:18px;height:18px;background:#e11d48;border-radius:50%;border:2px solid #fff;box-shadow:0 0 4px #0003;"></div>',
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+  popupAnchor: [0, -9],
+});
+
+const UserLocationIcon = new L.DivIcon({
+  className: '',
+  html: '<div style="width:18px;height:18px;background:#fff;border-radius:50%;border:2px solid #2563eb;box-shadow:0 0 6px #2563eb99;"></div>',
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+  popupAnchor: [0, -9],
+});
+
+function LocateUser({ setUserLocation }: { setUserLocation: (latlng: L.LatLng) => void }) {
   const map = useMap();
-  
+
   useEffect(() => {
     function onLocationFound(e: LocationEvent): void {
-      console.log("Location found:", e.latlng);
+      setUserLocation(e.latlng);
     }
 
     function onLocationError(e: LocationErrorEvent): void {
@@ -54,14 +71,14 @@ function LocateUser() {
 
     map.on("locationfound", onLocationFound);
     map.on("locationerror", onLocationError);
-    map.locate({ setView: true, maxZoom: 16 });
+    map.locate({ setView: false, watch: true, maxZoom: 16 });
 
     return () => {
       map.off("locationfound", onLocationFound);
       map.off("locationerror", onLocationError);
     };
-  }, [map]);
-  
+  }, [map, setUserLocation]);
+
   return null;
 }
 
@@ -80,14 +97,14 @@ function dataURLtoBlob(dataurl: string): Blob {
 const putImageInStorage = async (image: string): Promise<string> => {
   const supabase = await createClient();
   const user = await getUser();
-  
+
   if (!user || !user.id) {
     throw new Error("User not found. Cannot upload image.");
   }
-  
+
   const imageBlob = dataURLtoBlob(image);
   const fileName = `user-${user.id}/${Date.now()}.png`;
-  
+
   const { data, error } = await supabase.storage
     .from("images")
     .upload(fileName, imageBlob, {
@@ -104,9 +121,9 @@ const putImageInStorage = async (image: string): Promise<string> => {
 };
 
 const onHandleSubmit = async (
-  photo: string, 
-  description: string, 
-  lat: number | null, 
+  photo: string,
+  description: string,
+  lat: number | null,
   lng: number | null
 ): Promise<void> => {
   if (!lat || !lng) {
@@ -115,7 +132,7 @@ const onHandleSubmit = async (
 
   const supabase = await createClient();
   const user = await getUser();
-  
+
   if (!user || !user.id) {
     throw new Error("User not found. Cannot submit post.");
   }
@@ -136,7 +153,7 @@ const onHandleSubmit = async (
       console.error("Database insert error:", error);
       throw new Error(`Failed to save snap: ${error.message}`);
     }
-    
+
   } catch (error) {
     console.error("Submit error:", error);
     throw error;
@@ -155,9 +172,24 @@ const MapComponent = () => {
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
   const [snaps, setSnaps] = useState<Snap[]>([]);
+  const [snapAddresses, setSnapAddresses] = useState<{ [snapId: string]: string | null }>({});
   const [error, setError] = useState<string | null>(null);
-  
+  const [userLocation, setUserLocation] = useState<L.LatLng | null>(null);
+  useEffect(() => {
+    if (userLocation) {
+      getLocationName(userLocation.lat, userLocation.lng);
+    }
+  }, [userLocation]);
+
   const markerRefs = useRef<(L.Marker | null)[]>([]);
+  const [reactionState, setReactionState] = useState<{
+    [snapId: string]: {
+      userReacted: string | null;
+      userId: string | null;
+    }
+  }>({});
+  const emojis = ["👍", "😂", "😍", "🔥", "😮", "😢"];
+
   const cleanupStream = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
@@ -167,6 +199,62 @@ const MapComponent = () => {
       videoRef.current.srcObject = null;
     }
   }, []);
+
+
+  useEffect(() => {
+    (async () => {
+      const user = await getUser();
+      if (!snaps.length) return;
+      setReactionState(prev => {
+        const next = { ...prev };
+        for (const snap of snaps) {
+          let userReacted: string | null = null;
+          if (snap.reactions && user && user.id) {
+            for (const emoji of emojis) {
+              if (Array.isArray(snap.reactions[emoji]) && snap.reactions[emoji].includes(user.id)) {
+                userReacted = emoji;
+                break;
+              }
+            }
+          }
+          next[snap.id] = {
+            userReacted,
+            userId: user?.id || null,
+          };
+        }
+        Object.keys(next).forEach(id => {
+          if (!snaps.find(s => s.id === id)) delete next[id];
+        });
+        return next;
+      });
+    })();
+  }, [snaps]);
+
+  const handleReaction = async (snapId: string, emoji: string) => {
+    const user = await getUser();
+    if (!user || !user.id) return;
+    const snap = snaps.find(s => s.id === snapId);
+    if (!snap) return;
+    const currentReactions: { [emoji: string]: string[] } = { ...Object.fromEntries(emojis.map(e => [e, []])), ...(snap.reactions || {}) };
+    const userReacted = reactionState[snapId]?.userReacted;
+    let newReactions = { ...currentReactions };
+    
+    for (const e of emojis) {
+      newReactions[e] = (newReactions[e] || []).filter((uid: string) => uid !== user.id);
+    }
+    let newUserReacted = null;
+    if (userReacted !== emoji) {
+      newReactions[emoji] = [...(newReactions[emoji] || []), user.id];
+      newUserReacted = emoji;
+    }
+    setReactionState(prev => ({
+      ...prev,
+      [snapId]: { userReacted: newUserReacted, userId: user.id },
+    }));
+    const supabase = await createClient();
+    await supabase.from("snaps").update({ reactions: newReactions }).eq("id", snapId);
+    fetchSnaps();
+  };
 
   const fetchSnaps = useCallback(async () => {
     try {
@@ -207,6 +295,28 @@ const MapComponent = () => {
     };
   }, [fetchSnaps]);
 
+  useEffect(() => {
+    async function fetchAddresses() {
+      const newAddresses: { [snapId: string]: string | null } = {};
+      await Promise.all(snaps.map(async (snap) => {
+        const snapLat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
+        const snapLng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
+        if (!snapLat || !snapLng || isNaN(snapLat) || isNaN(snapLng)) {
+          newAddresses[snap.id] = null;
+          return;
+        }
+        const address = await getLocationName(snapLat, snapLng);
+        newAddresses[snap.id] = address;
+      }));
+      setSnapAddresses(newAddresses);
+    }
+    if (snaps.length > 0)  {
+      fetchAddresses();
+    } else {
+      setSnapAddresses({});
+    }
+  }, [snaps]);
+
 
   useEffect(() => {
     if (navigator.geolocation) {
@@ -219,7 +329,7 @@ const MapComponent = () => {
           console.warn("Could not get location:", err);
           setError("Location access denied. Please enable location services.");
         },
-        { 
+        {
           enableHighAccuracy: true,
           timeout: 10000,
           maximumAge: 300000
@@ -235,15 +345,15 @@ const MapComponent = () => {
       if (showCamera && videoRef.current) {
         try {
           cleanupStream();
-          
+
           const stream = await navigator.mediaDevices.getUserMedia({
-            video: { 
+            video: {
               facingMode: useFrontCamera ? "user" : "environment",
               width: { ideal: 1920 },
               height: { ideal: 1080 }
             }
           });
-          
+
           streamRef.current = stream;
           videoRef.current.srcObject = stream;
         } catch (err) {
@@ -268,7 +378,7 @@ const MapComponent = () => {
   const handleCapture = () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    
+
     if (!video || !canvas) {
       setError("Camera not ready. Please try again.");
       return;
@@ -278,7 +388,7 @@ const MapComponent = () => {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext("2d");
-      
+
       if (!ctx) {
         setError("Failed to get canvas context.");
         return;
@@ -293,7 +403,7 @@ const MapComponent = () => {
       } else {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       }
-      
+
       const dataUrl = canvas.toDataURL("image/png", 0.8);
       setPhoto(dataUrl);
       setShowCamera(false);
@@ -337,7 +447,7 @@ const MapComponent = () => {
         <div className="fixed top-4 left-4 right-4 z-50 bg-red-600 text-white p-3 rounded-lg shadow-lg">
           <div className="flex justify-between items-center">
             <span>{error}</span>
-            <button 
+            <button
               onClick={() => setError(null)}
               className="ml-2 text-white hover:text-gray-200"
             >
@@ -359,7 +469,14 @@ const MapComponent = () => {
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
-            <LocateUser />
+            <LocateUser setUserLocation={setUserLocation} />
+            {userLocation && (
+              <Marker position={[userLocation.lat, userLocation.lng]} icon={UserLocationIcon}>
+                <Popup minWidth={120} closeOnEscapeKey={true}>
+                  <div className="text-center text-xs font-mono text-blue-700">You are here<br />({userLocation.lat.toFixed(5)}, {userLocation.lng.toFixed(5)})</div>
+                </Popup>
+              </Marker>
+            )}
             {snaps.map((snap, idx) => {
               const snapLat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
               const snapLng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
@@ -367,43 +484,65 @@ const MapComponent = () => {
                 console.warn(`Invalid coordinates for snap ${snap.id}:`, { lat: snap.lat, lng: snap.lng });
                 return null;
               }
+              const snapReactions = snap.reactions || Object.fromEntries(emojis.map(e => [e, []]));
+              const userReacted = reactionState[snap.id]?.userReacted || null;
               return (
                 <Marker
                   key={`marker-${snap.id}`}
                   position={[snapLat, snapLng]}
+                  icon={DotIcon}
                   ref={(el) => {
                     markerRefs.current[idx] = el;
                   }}
                 >
-                  <Popup maxWidth={800} maxHeight={900} closeOnEscapeKey={true}>
+                  <Popup maxWidth={400} maxHeight={500} closeOnEscapeKey={true}>
                     <div
                       className="flex flex-col items-center p-2 bg-white rounded-lg shadow-lg"
-                      style={{ overflow: 'hidden', width: '100%', maxWidth: 700, boxSizing: 'border-box' }}
+                      style={{ overflow: 'hidden', width: 340, boxSizing: 'border-box' }}
                     >
                       <img
                         src={`${SUPABASE_URL}/storage/v1/object/public/images/${snap.image_url}`}
                         alt="Snap"
-                        className="rounded-lg border border-zinc-300 mb-3"
+                        className="rounded-lg border border-zinc-300 mb-2"
                         style={{
                           display: 'block',
-                          maxWidth: '100%',
-                          maxHeight: '65vh',
-                          width: 'auto',
-                          height: 'auto',
+                          width: '100%',
+                          maxWidth: 300,
+                          maxHeight: 180,
                           background: '#f0f0f0',
-                          objectFit: 'contain',
+                          objectFit: 'cover',
                         }}
                         loading="lazy"
                       />
-                      <div className="text-gray-800 text-base text-center break-words w-full px-2 leading-tight mb-1">
+                      <div className="text-xs text-zinc-500 mb-1 font-mono">
+                        {new Date(snap.created_at).toLocaleTimeString('ro-RO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </div>
+                      <div className="flex flex-row gap-2 justify-center items-center w-full mb-2 mt-1">
+                        {emojis.map((emoji) => (
+                          <button
+                            key={emoji}
+                            className={`flex flex-col items-center px-2 py-1 rounded-lg transition-all text-xl font-bold border border-transparent hover:bg-zinc-100 active:scale-95 ${userReacted === emoji ? 'bg-yellow-100 border-yellow-400' : ''}`}
+                            onClick={() => handleReaction(snap.id, emoji)}
+                            title={userReacted ? (userReacted === emoji ? 'Remove reaction' : 'Change your reaction') : 'React'}
+                          >
+                            <span>{emoji}</span>
+                            <span className="text-xs font-semibold text-zinc-600 mt-0.5">{(snapReactions[emoji] || []).length}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="text-gray-800 text-base text-center break-words w-full px-2 leading-tight mb-1 mt-1">
                         {snap.description.length > 60 ? `${snap.description.substring(0, 60)}...` : snap.description}
                       </div>
-                      <div className="text-gray-500 text-xs mt-1 font-mono">
-                        {new Date(snap.created_at).toLocaleDateString('ro-RO', {
+                      <div className="text-gray-500 text-sm mt-1 font-mono">
+                        {new Date(snap.created_at).toLocaleDateString('en-US', {
                           day: '2-digit',
                           month: '2-digit',
                           year: '2-digit'
                         })}
+                        <span className="ml-2">{new Date(snap.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                      </div>
+                      <div className="text-gray-700 text-xs mt-1 font-mono text-center min-h-[18px]">
+                        {snapAddresses[snap.id] === undefined ? 'Searching address...' : (snapAddresses[snap.id] || 'Address unavailable')}
                       </div>
                     </div>
                   </Popup>
@@ -454,10 +593,10 @@ const MapComponent = () => {
       {photo && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4">
           <div className="bg-zinc-900 rounded-xl shadow-2xl p-6 flex flex-col items-center max-w-sm w-full border border-zinc-700">
-            <img 
-              src={photo} 
-              alt="Captured" 
-              className="max-w-full max-h-[50vh] object-contain rounded mb-4 border-2 border-zinc-700" 
+            <img
+              src={photo}
+              alt="Captured"
+              className="max-w-full max-h-[50vh] object-contain rounded mb-4 border-2 border-zinc-700"
             />
             <textarea
               className="w-full mb-4 p-3 rounded-lg bg-zinc-800 text-white border border-zinc-600 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -511,5 +650,13 @@ const MapComponent = () => {
     </div>
   );
 };
+
+async function getLocationName(lat: number, lng: number): Promise<string | null> {
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'snaphood/1.0' } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.display_name || null;
+}
 
 export default MapComponent;
