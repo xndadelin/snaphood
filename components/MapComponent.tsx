@@ -1,5 +1,7 @@
 "use client";
-import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
+import SnapDetailsModal from "./SnapDetailsModal";
+import CameraModal from "./CameraModal";
+import ClusteredMap from "./ClusteredMap";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
@@ -55,36 +57,6 @@ const UserLocationIcon = new L.DivIcon({
   iconAnchor: [9, 9],
   popupAnchor: [0, -9],
 });
-
-function LocateUser({ setUserLocation }: { setUserLocation: (latlng: L.LatLng) => void }) {
-  const map = useMap();
-
-  useEffect(() => {
-    function onLocationFound(e: LocationEvent): void {
-      setUserLocation(e.latlng);
-    }
-
-    function onLocationError(e: LocationErrorEvent): void {
-      console.warn("Location error:", e);
-      if (e.code === 1) {
-        alert("Location access denied. Please enable location services to see your position on the map.");
-      } else {
-        alert("Unable to retrieve your location. Please check your location settings.");
-      }
-    }
-
-    map.on("locationfound", onLocationFound);
-    map.on("locationerror", onLocationError);
-    map.locate({ setView: false, watch: true, maxZoom: 16 });
-
-    return () => {
-      map.off("locationfound", onLocationFound);
-      map.off("locationerror", onLocationError);
-    };
-  }, [map, setUserLocation]);
-
-  return null;
-}
 
 function dataURLtoBlob(dataurl: string): Blob {
   const arr = dataurl.split(',');
@@ -165,6 +137,7 @@ const onHandleSubmit = async (
 };
 
 const MapComponent = () => {
+  const [selectedSnap, setSelectedSnap] = useState<Snap | null>(null);
   const [showCamera, setShowCamera] = useState(false);
   const [useFrontCamera, setUseFrontCamera] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -552,172 +525,48 @@ const MapComponent = () => {
 
       <div className="fixed inset-0 w-full h-full z-0">
         <div style={{ height: "100vh", width: "100vw" }}>
-          <MapContainer
-            center={mapCenter}
-            zoom={mapZoom}
-            scrollWheelZoom={true}
-            style={{ height: "100vh", width: "100vw" }}
-          >
-            <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
-            <LocateUser setUserLocation={setUserLocation} />
-            {userLocation && (
-              <Marker position={[userLocation.lat, userLocation.lng]} icon={UserLocationIcon}>
-                <Popup minWidth={120} closeOnEscapeKey={true}>
-                  <div className="text-center text-xs font-mono text-blue-700">You are here<br />({userLocation.lat.toFixed(5)}, {userLocation.lng.toFixed(5)})</div>
-                </Popup>
-              </Marker>
-            )}
-            {snaps.map((snap, idx) => {
-              const snapLat = typeof snap.lat === 'string' ? parseFloat(snap.lat) : snap.lat;
-              const snapLng = typeof snap.lng === 'string' ? parseFloat(snap.lng) : snap.lng;
-              if (!snapLat || !snapLng || isNaN(snapLat) || isNaN(snapLng)) {
-                console.warn(`Invalid coordinates for snap ${snap.id}:`, { lat: snap.lat, lng: snap.lng });
-                return null;
-              }
-              // const snapReactions = snap.reactions || Object.fromEntries(emojis.map(e => [e, []]));
-              // const userReacted = reactionState[snap.id]?.userReacted || null;
-              return (
-                <Marker
-                  key={`marker-${snap.id}`}
-                  position={[snapLat, snapLng]}
-                  icon={DotIcon}
-                  ref={(el) => {
-                    markerRefs.current[idx] = el;
-                  }}
-                >
-                  <Popup maxWidth={400} maxHeight={500} closeOnEscapeKey={true}>
-                    <div
-                      className="flex flex-col items-center p-2 bg-white rounded-lg shadow-lg"
-                      style={{ overflow: 'hidden', width: 340, boxSizing: 'border-box' }}
-                    >
-                      <img  
-                        src={`${SUPABASE_URL}/storage/v1/object/public/images/${snap.image_url}`}
-                        alt="Snap"
-                        className="rounded-lg border border-zinc-300 mb-2"
-                        style={{
-                          display: 'block',
-                          width: '100%',
-                          maxWidth: 300,
-                          maxHeight: 180,
-                          background: '#f0f0f0',
-                          objectFit: 'cover',
-                        }}
-                        loading="lazy"
-                      />
-                      {snap.utilizatori?.name && (
-                        <div className="text-sm font-semibold text-blue-700 mb-1">
-                          {snap.utilizatori.name}
-                        </div>
-                      )}
-                      {/* <div className="flex flex-row gap-2 justify-center items-center w-full mb-2 mt-1">
-                        {emojis.map((emoji) => (
-                          <button
-                            key={emoji}
-                            className={`flex flex-col items-center px-2 py-1 rounded-lg transition-all text-xl font-bold border border-transparent hover:bg-zinc-100 active:scale-95 ${userReacted === emoji ? 'bg-yellow-100 border-yellow-400' : ''}`}
-                            onClick={() => handleReaction(snap.id, emoji)}
-                            title={userReacted ? (userReacted === emoji ? 'Remove reaction' : 'Change your reaction') : 'React'}
-                          >
-                            <span>{emoji}</span>
-                            <span className="text-xs font-semibold text-zinc-600 mt-0.5">{(snapReactions[emoji] || []).length}</span>
-                          </button>
-                        ))}
-                      </div> */}
-                      <div className="text-gray-800 text-base text-center break-words w-full px-2 leading-tight mb-1 mt-1">
-                        {snap.description.length > 60 ? `${snap.description.substring(0, 60)}...` : snap.description}
-                      </div>
-                      <div className="text-gray-500 text-sm mt-1 font-mono">
-                        {new Date(snap.created_at).toLocaleDateString('en-US', {
-                          day: '2-digit',
-                          month: '2-digit',
-                          year: '2-digit'
-                        })}
-                        <span className="ml-2">{new Date(snap.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                      </div>
-                      <div className="text-gray-700 text-xs mt-1 font-mono text-center min-h-[18px]">
-                        {snapAddresses[snap.id] === undefined ? 'Searching address...' : (snapAddresses[snap.id] || 'Address unavailable')}
-                      </div>
-                      <div className="w-full mt-2">
-                        <div className="font-semibold text-sm text-gray-800 mb-1">Comments</div>
-                        <div className="flex flex-col gap-2 max-h-32 overflow-y-auto bg-zinc-900 rounded-lg border border-gray-700 p-2">
-                          {Array.isArray(comments[snap.id]) && comments[snap.id].length > 0 ? (
-                            comments[snap.id].map((c) => (
-                              <div key={c.id} className="text-xs text-zinc-100 flex flex-row items-center gap-2">
-                                <span className="font-semibold text-blue-400">{c.user_name || c.user_id?.slice(0, 6) || 'user'}:</span>
-                                <span className="text-zinc-100">{c.text}</span>
-                                <span className="text-gray-400 ml-auto">{new Date(c.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
-                              </div>
-                            ))
-                          ) : (
-                            <div className="text-xs text-gray-400 italic text-center">No comments yet.</div>
-                          )}
-                        </div>
-                        <div className="flex mt-2 gap-2">
-                        <input
-                          type="text"
-                          className="flex-1 px-2 py-1 rounded border border-zinc-700 bg-zinc-800 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm placeholder-gray-400"
-                          placeholder="Add a comment..."
-                          value={commentInputs[snap.id] || ''}
-                          onChange={e => handleCommentInput(snap.id, e.target.value)}
-                          disabled={commentLoading[snap.id]}
-                          maxLength={300}
-                        />
-                          <button
-                            className="px-3 py-1 bg-blue-600 text-white rounded font-semibold text-sm disabled:opacity-60"
-                            disabled={commentLoading[snap.id] || !(commentInputs[snap.id] && commentInputs[snap.id].trim())}
-                            onClick={() => handleCommentSubmit(snap.id)}
-                          >
-                            {commentLoading[snap.id] ? '...' : 'Post'}
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </Popup>
-                </Marker>
-              );
-            })}
-          </MapContainer>
+          <ClusteredMap
+            snaps={snaps}
+            snapAddresses={snapAddresses}
+            userLocation={userLocation}
+            comments={comments}
+            commentInputs={commentInputs}
+            commentLoading={commentLoading}
+            onCommentInput={handleCommentInput}
+            onCommentSubmit={handleCommentSubmit}
+            setUserLocation={setUserLocation}
+            onSnapDetails={setSelectedSnap}
+          />
         </div>
       </div>
-
-      {showCamera && (
-        <div className="fixed inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="rounded-lg shadow-lg w-full max-w-sm mb-4"
-            style={useFrontCamera ? { transform: 'scaleX(-1)' } : {}}
+      {selectedSnap && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <SnapDetailsModal
+            snap={selectedSnap}
+            supabaseUrl={SUPABASE_URL}
+            address={snapAddresses[selectedSnap.id]}
+            comments={comments[selectedSnap.id] || []}
+            commentInput={commentInputs[selectedSnap.id] || ''}
+            commentLoading={commentLoading[selectedSnap.id]}
+            onCommentInput={val => handleCommentInput(selectedSnap.id, val)}
+            onCommentSubmit={() => handleCommentSubmit(selectedSnap.id)}
+            onClose={() => setSelectedSnap(null)}
           />
-          <div className="flex gap-3 mb-4 flex-wrap justify-center">
-            <button
-              className="min-w-[80px] px-4 py-2 bg-green-600 text-white rounded-full font-semibold shadow hover:bg-green-700 transition-colors"
-              onClick={handleCapture}
-            >
-              Capture
-            </button>
-            <button
-              className="min-w-[80px] px-4 py-2 bg-blue-600 text-white rounded-full font-semibold shadow hover:bg-blue-700 transition-colors"
-              onClick={() => setUseFrontCamera((v) => !v)}
-            >
-              Flip
-            </button>
-            <button
-              className="min-w-[80px] px-4 py-2 bg-gray-600 text-white rounded-full font-semibold shadow hover:bg-gray-700 transition-colors"
-              onClick={() => {
-                setShowCamera(false);
-                cleanupStream();
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-          <canvas ref={canvasRef} className="hidden" />
         </div>
       )}
+
+      <CameraModal
+        show={showCamera}
+        videoRef={videoRef as React.RefObject<HTMLVideoElement>}
+        canvasRef={canvasRef as React.RefObject<HTMLCanvasElement>}
+        useFrontCamera={useFrontCamera}
+        onCapture={handleCapture}
+        onFlip={() => setUseFrontCamera((v) => !v)}
+        onCancel={() => {
+          setShowCamera(false);
+          cleanupStream();
+        }}
+      />
 
       {photo && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center z-50 p-4">
