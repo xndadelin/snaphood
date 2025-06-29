@@ -23,6 +23,10 @@ interface Snap {
   lng: number;
   created_at: string;
   reactions?: { [emoji: string]: string[] };
+  utilizatori?: {
+    name?: string;
+    avatar_url?: string;
+  };
 }
 
 interface LocationEvent {
@@ -173,6 +177,77 @@ const MapComponent = () => {
   const [lng, setLng] = useState<number | null>(null);
   const [snaps, setSnaps] = useState<Snap[]>([]);
   const [snapAddresses, setSnapAddresses] = useState<{ [snapId: string]: string | null }>({});
+  
+  const [comments, setComments] = useState<{ [snapId: string]: Array<{ id: string; user_id: string; text: string; created_at: string; user_name?: string }> }>({});
+  const [commentInputs, setCommentInputs] = useState<{ [snapId: string]: string }>({});
+  const [commentLoading, setCommentLoading] = useState<{ [snapId: string]: boolean }>({});
+
+  const fetchComments = useCallback(async (snapId: string) => {
+    try {
+      const supabase = await createClient();
+
+      const { data: commentsData, error: commentsError } = await supabase
+        .from("comentarii")
+        .select("id, user_id, text, created_at")
+        .eq("snap_id", snapId)
+        .order("created_at", { ascending: true });
+      
+      if (commentsError || !commentsData) return;
+      
+      const userIds = Array.from(new Set(commentsData.map((c: any) => c.user_id)));
+      let usersMap: { [id: string]: { name?: string } } = {};
+      if (userIds.length > 0) {
+        const { data: usersData, error: usersError } = await supabase
+          .from("utilizatori")
+          .select("id, name")
+          .in("id", userIds);
+        
+        if (!usersError && usersData) {
+          usersMap = usersData.reduce((acc: any, user: any) => {
+            acc[user.id] = user;
+            return acc;
+          }, {});
+        }
+      }
+      setComments(prev => ({
+        ...prev,
+        [snapId]: commentsData.map((c: any) => ({ ...c, user_name: usersMap[c.user_id]?.name }))
+      }));
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    snaps.forEach(snap => {
+      fetchComments(snap.id);
+    });
+  }, [snaps, fetchComments]);
+
+
+  const handleCommentInput = (snapId: string, value: string) => {
+    setCommentInputs(prev => ({ ...prev, [snapId]: value }));
+  };
+
+  const handleCommentSubmit = async (snapId: string) => {
+    const text = (commentInputs[snapId] || '').trim();
+    if (!text) return;
+    setCommentLoading(prev => ({ ...prev, [snapId]: true }));
+    try {
+      const supabase = await createClient();
+      const user = await getUser();
+      if (!user || !user.id) throw new Error('Not logged in');
+      const { error } = await supabase.from("comentarii").insert({
+        snap_id: snapId,
+        user_id: user.id,
+        text
+      });
+      if (!error) {
+        setCommentInputs(prev => ({ ...prev, [snapId]: '' }));
+        fetchComments(snapId);
+      }
+    } finally {
+      setCommentLoading(prev => ({ ...prev, [snapId]: false }));
+    }
+  };
   const [error, setError] = useState<string | null>(null);
   const [userLocation, setUserLocation] = useState<L.LatLng | null>(null);
   useEffect(() => {
@@ -182,13 +257,13 @@ const MapComponent = () => {
   }, [userLocation]);
 
   const markerRefs = useRef<(L.Marker | null)[]>([]);
-  const [reactionState, setReactionState] = useState<{
-    [snapId: string]: {
-      userReacted: string | null;
-      userId: string | null;
-    }
-  }>({});
-  const emojis = ["👍", "😂", "😍", "🔥", "😮", "😢"];
+  // const [reactionState, setReactionState] = useState<{
+  //   [snapId: string]: {
+  //     userReacted: string | null;
+  //     userId: string | null;
+  //   }
+  // }>({});
+  // const emojis = ["👍", "😂", "😍", "🔥", "😮", "😢"];
 
   const cleanupStream = useCallback(() => {
     if (streamRef.current) {
@@ -201,76 +276,90 @@ const MapComponent = () => {
   }, []);
 
 
-  useEffect(() => {
-    (async () => {
-      const user = await getUser();
-      if (!snaps.length) return;
-      setReactionState(prev => {
-        const next = { ...prev };
-        for (const snap of snaps) {
-          let userReacted: string | null = null;
-          if (snap.reactions && user && user.id) {
-            for (const emoji of emojis) {
-              if (Array.isArray(snap.reactions[emoji]) && snap.reactions[emoji].includes(user.id)) {
-                userReacted = emoji;
-                break;
-              }
-            }
-          }
-          next[snap.id] = {
-            userReacted,
-            userId: user?.id || null,
-          };
-        }
-        Object.keys(next).forEach(id => {
-          if (!snaps.find(s => s.id === id)) delete next[id];
-        });
-        return next;
-      });
-    })();
-  }, [snaps]);
+  // useEffect(() => {
+  //   (async () => {
+  //     const user = await getUser();
+  //     if (!snaps.length) return;
+  //     setReactionState(prev => {
+  //       const next = { ...prev };
+  //       for (const snap of snaps) {
+  //         let userReacted: string | null = null;
+  //         if (snap.reactions && user && user.id) {
+  //           for (const emoji of emojis) {
+  //             if (Array.isArray(snap.reactions[emoji]) && snap.reactions[emoji].includes(user.id)) {
+  //               userReacted = emoji;
+  //               break;
+  //             }
+  //           }
+  //         }
+  //         next[snap.id] = {
+  //           userReacted,
+  //           userId: user?.id || null,
+  //         };
+  //       }
+  //       Object.keys(next).forEach(id => {
+  //         if (!snaps.find(s => s.id === id)) delete next[id];
+  //       });
+  //       return next;
+  //     });
+  //   })();
+  // }, [snaps]);
 
-  const handleReaction = async (snapId: string, emoji: string) => {
-    const user = await getUser();
-    if (!user || !user.id) return;
-    const snap = snaps.find(s => s.id === snapId);
-    if (!snap) return;
-    const currentReactions: { [emoji: string]: string[] } = { ...Object.fromEntries(emojis.map(e => [e, []])), ...(snap.reactions || {}) };
-    const userReacted = reactionState[snapId]?.userReacted;
-    let newReactions = { ...currentReactions };
-    
-    for (const e of emojis) {
-      newReactions[e] = (newReactions[e] || []).filter((uid: string) => uid !== user.id);
-    }
-    let newUserReacted = null;
-    if (userReacted !== emoji) {
-      newReactions[emoji] = [...(newReactions[emoji] || []), user.id];
-      newUserReacted = emoji;
-    }
-    setReactionState(prev => ({
-      ...prev,
-      [snapId]: { userReacted: newUserReacted, userId: user.id },
-    }));
-    const supabase = await createClient();
-    await supabase.from("snaps").update({ reactions: newReactions }).eq("id", snapId);
-    fetchSnaps();
-  };
+  // const handleReaction = async (snapId: string, emoji: string) => {
+  //   const user = await getUser();
+  //   if (!user || !user.id) return;
+  //   const snap = snaps.find(s => s.id === snapId);
+  //   if (!snap) return;
+  //   const currentReactions: { [emoji: string]: string[] } = { ...Object.fromEntries(emojis.map(e => [e, []])), ...(snap.reactions || {}) };
+  //   const userReacted = reactionState[snapId]?.userReacted;
+  //   let newReactions = { ...currentReactions };
+  //   
+  //   for (const e of emojis) {
+  //     newReactions[e] = (newReactions[e] || []).filter((uid: string) => uid !== user.id);
+  //   }
+  //   let newUserReacted = null;
+  //   if (userReacted !== emoji) {
+  //     newReactions[emoji] = [...(newReactions[emoji] || []), user.id];
+  //     newUserReacted = emoji;
+  //   }
+  //   setReactionState(prev => ({
+  //     ...prev,
+  //     [snapId]: { userReacted: newUserReacted, userId: user.id },
+  //   }));
+  //   const supabase = await createClient();
+  //   await supabase.from("snaps").update({ reactions: newReactions }).eq("id", snapId);
+  //   fetchSnaps();
+  // };
 
   const fetchSnaps = useCallback(async () => {
     try {
       const supabase = await createClient();
-      const { data, error } = await supabase
+      const { data: snapsData, error: snapsError } = await supabase
         .from("snaps")
         .select("*")
         .order("created_at", { ascending: false });
-      if (error) {
-        console.error("Error fetching snaps:", error);
+      if (snapsError) {
+        console.error("Error fetching snaps:", snapsError);
         setError("Failed to load snaps");
         return;
       }
-      if (data) {
-        setSnaps(data);
+      const { data: usersData, error: usersError } = await supabase
+        .from("utilizatori")
+        .select("id, name, avatar_url");
+      if (usersError) {
+        console.error("Error fetching users:", usersError);
+        setError("Failed to load users");
+        return;
       }
+      const usersMap = (usersData || []).reduce((acc: any, user: any) => {
+        acc[user.id] = user;
+        return acc;
+      }, {});
+      const snapsWithUser = (snapsData || []).map((snap: any) => ({
+        ...snap,
+        utilizatori: usersMap[snap.user_id] || null,
+      }));
+      setSnaps(snapsWithUser);
     } catch (err) {
       console.error("Fetch snaps error:", err);
       setError("Failed to load snaps");
@@ -305,8 +394,12 @@ const MapComponent = () => {
           newAddresses[snap.id] = null;
           return;
         }
-        const address = await getLocationName(snapLat, snapLng);
-        newAddresses[snap.id] = address;
+        try {
+          const address = await getLocationName(snapLat, snapLng);
+          newAddresses[snap.id] = address;
+        } catch {
+          newAddresses[snap.id] = "Address unavailable";
+        }
       }));
       setSnapAddresses(newAddresses);
     }
@@ -484,8 +577,8 @@ const MapComponent = () => {
                 console.warn(`Invalid coordinates for snap ${snap.id}:`, { lat: snap.lat, lng: snap.lng });
                 return null;
               }
-              const snapReactions = snap.reactions || Object.fromEntries(emojis.map(e => [e, []]));
-              const userReacted = reactionState[snap.id]?.userReacted || null;
+              // const snapReactions = snap.reactions || Object.fromEntries(emojis.map(e => [e, []]));
+              // const userReacted = reactionState[snap.id]?.userReacted || null;
               return (
                 <Marker
                   key={`marker-${snap.id}`}
@@ -500,7 +593,7 @@ const MapComponent = () => {
                       className="flex flex-col items-center p-2 bg-white rounded-lg shadow-lg"
                       style={{ overflow: 'hidden', width: 340, boxSizing: 'border-box' }}
                     >
-                      <img
+                      <img  
                         src={`${SUPABASE_URL}/storage/v1/object/public/images/${snap.image_url}`}
                         alt="Snap"
                         className="rounded-lg border border-zinc-300 mb-2"
@@ -514,10 +607,12 @@ const MapComponent = () => {
                         }}
                         loading="lazy"
                       />
-                      <div className="text-xs text-zinc-500 mb-1 font-mono">
-                        {new Date(snap.created_at).toLocaleTimeString('ro-RO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                      </div>
-                      <div className="flex flex-row gap-2 justify-center items-center w-full mb-2 mt-1">
+                      {snap.utilizatori?.name && (
+                        <div className="text-sm font-semibold text-blue-700 mb-1">
+                          {snap.utilizatori.name}
+                        </div>
+                      )}
+                      {/* <div className="flex flex-row gap-2 justify-center items-center w-full mb-2 mt-1">
                         {emojis.map((emoji) => (
                           <button
                             key={emoji}
@@ -529,7 +624,7 @@ const MapComponent = () => {
                             <span className="text-xs font-semibold text-zinc-600 mt-0.5">{(snapReactions[emoji] || []).length}</span>
                           </button>
                         ))}
-                      </div>
+                      </div> */}
                       <div className="text-gray-800 text-base text-center break-words w-full px-2 leading-tight mb-1 mt-1">
                         {snap.description.length > 60 ? `${snap.description.substring(0, 60)}...` : snap.description}
                       </div>
@@ -543,6 +638,40 @@ const MapComponent = () => {
                       </div>
                       <div className="text-gray-700 text-xs mt-1 font-mono text-center min-h-[18px]">
                         {snapAddresses[snap.id] === undefined ? 'Searching address...' : (snapAddresses[snap.id] || 'Address unavailable')}
+                      </div>
+                      <div className="w-full mt-2">
+                        <div className="font-semibold text-sm text-gray-800 mb-1">Comments</div>
+                        <div className="flex flex-col gap-2 max-h-32 overflow-y-auto bg-zinc-900 rounded-lg border border-gray-700 p-2">
+                          {Array.isArray(comments[snap.id]) && comments[snap.id].length > 0 ? (
+                            comments[snap.id].map((c) => (
+                              <div key={c.id} className="text-xs text-zinc-100 flex flex-row items-center gap-2">
+                                <span className="font-semibold text-blue-400">{c.user_name || c.user_id?.slice(0, 6) || 'user'}:</span>
+                                <span className="text-zinc-100">{c.text}</span>
+                                <span className="text-gray-400 ml-auto">{new Date(c.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="text-xs text-gray-400 italic text-center">No comments yet.</div>
+                          )}
+                        </div>
+                        <div className="flex mt-2 gap-2">
+                        <input
+                          type="text"
+                          className="flex-1 px-2 py-1 rounded border border-zinc-700 bg-zinc-800 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm placeholder-gray-400"
+                          placeholder="Add a comment..."
+                          value={commentInputs[snap.id] || ''}
+                          onChange={e => handleCommentInput(snap.id, e.target.value)}
+                          disabled={commentLoading[snap.id]}
+                          maxLength={300}
+                        />
+                          <button
+                            className="px-3 py-1 bg-blue-600 text-white rounded font-semibold text-sm disabled:opacity-60"
+                            disabled={commentLoading[snap.id] || !(commentInputs[snap.id] && commentInputs[snap.id].trim())}
+                            onClick={() => handleCommentSubmit(snap.id)}
+                          >
+                            {commentLoading[snap.id] ? '...' : 'Post'}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </Popup>
